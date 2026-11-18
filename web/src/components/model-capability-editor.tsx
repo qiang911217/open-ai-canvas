@@ -21,6 +21,7 @@ import {
 
 import {
     DEFAULT_VIDEO_PROCESSING_MAX_SOURCE_SECONDS,
+    MEDIAKIT_DEPTH_MAX_SOURCE_SECONDS,
     defaultImageCapabilityConfig,
     defaultModelCapabilityConfig,
     normalizeModelCapabilityConfig,
@@ -49,6 +50,7 @@ const operationOptions = [
     { label: "风格迁移", value: "style_transfer" },
     { label: "音频生视频", value: "audio_to_video" },
     { label: "画质增强", value: "enhance" },
+    { label: "相对深度", value: "depth" },
 ];
 
 function ImageSizeHelp() {
@@ -64,15 +66,16 @@ type Props = {
     workflows?: ModelProtocolWorkflow[];
     imageParameters?: ImageParameter[];
     disabled?: boolean;
+    templateEditing?: boolean;
     section?: "all" | "protocol" | "references";
 };
 
-export function ModelCapabilityEditor({ value, onChange, protocol, capability = "video", model = "", workflows = [], imageParameters, disabled = false, section = "all" }: Props) {
+export function ModelCapabilityEditor({ value, onChange, protocol, capability = "video", model = "", workflows = [], imageParameters, disabled = false, templateEditing = false, section = "all" }: Props) {
     if (capability === "text") {
         return <TextCapabilityEditor value={value} onChange={onChange} protocol={protocol} disabled={disabled} section={section} />;
     }
     if (capability === "image") {
-        return <ImageCapabilityEditor value={value} onChange={onChange} protocol={protocol} model={model} imageParameters={imageParameters} disabled={disabled} section={section} />;
+        return <ImageCapabilityEditor value={value} onChange={onChange} protocol={protocol} model={model} imageParameters={imageParameters} disabled={disabled} templateEditing={templateEditing} section={section} />;
     }
     const workflow = findProtocolWorkflow(workflows, protocol, model);
     const storedProfile = normalizeModelCapabilityConfig(value || defaultModelCapabilityConfig(protocol, model)).video!;
@@ -86,34 +89,40 @@ export function ModelCapabilityEditor({ value, onChange, protocol, capability = 
     const autoDLSpecFields = <AutoDLScreenSpecFields profile={profile} workflow={workflow} disabled={disabled} onChange={(video) => onChange?.({ version: 1, video })} />;
     // 视频处理模型（画质增强等）：帧率策略与源视频时长上限；生成模型不显示。
     const processing = profile.processing;
+    const depthProcessing = profile.defaultOperation === "depth";
+    const maxProcessingSeconds = depthProcessing ? MEDIAKIT_DEPTH_MAX_SOURCE_SECONDS : DEFAULT_VIDEO_PROCESSING_MAX_SOURCE_SECONDS;
     const processingFields = processing ? (
         <div className="grid gap-3 sm:grid-cols-2">
-            <Field label="帧率策略">
-                <Select
-                    className="w-full"
-                    disabled={disabled}
-                    value={processing.fpsPolicy}
-                    options={[
-                        { label: "保持原帧率（按 ≤30fps 档预扣）", value: "keep_source" },
-                        { label: "用户选择帧率", value: "user_select" },
-                    ]}
-                    onChange={(fpsPolicy) =>
-                        update({ processing: fpsPolicy === "user_select" ? { ...processing, fpsPolicy, fpsOptions: processing.fpsOptions?.length ? processing.fpsOptions : [30, 60] } : { fpsPolicy, maxSourceSeconds: processing.maxSourceSeconds } })
-                    }
-                />
-            </Field>
+            {depthProcessing ? (
+                <p className="text-sm text-muted-foreground">固定 standard 档，不提供输出分辨率、帧率或码率选项。</p>
+            ) : (
+                <Field label="帧率策略">
+                    <Select
+                        className="w-full"
+                        disabled={disabled}
+                        value={processing.fpsPolicy}
+                        options={[
+                            { label: "保持原帧率（按 ≤30fps 档预扣）", value: "keep_source" },
+                            { label: "用户选择帧率", value: "user_select" },
+                        ]}
+                        onChange={(fpsPolicy) =>
+                            update({ processing: fpsPolicy === "user_select" ? { ...processing, fpsPolicy, fpsOptions: processing.fpsOptions?.length ? processing.fpsOptions : [30, 60] } : { fpsPolicy, maxSourceSeconds: processing.maxSourceSeconds } })
+                        }
+                    />
+                </Field>
+            )}
             {processing.fpsPolicy === "user_select" ? (
                 <Field label="可选帧率（15–120，逗号分隔）">
                     <Input disabled={disabled} value={(processing.fpsOptions || []).join(",")} placeholder="例如：30,60" onChange={(event) => update({ processing: { ...processing, fpsOptions: parseIntegerList(event.target.value) } })} />
                 </Field>
             ) : null}
             <NumberField
-                label={`源视频最长秒数（≤${DEFAULT_VIDEO_PROCESSING_MAX_SOURCE_SECONDS}）`}
-                value={processing.maxSourceSeconds || DEFAULT_VIDEO_PROCESSING_MAX_SOURCE_SECONDS}
+                label={`源视频最长秒数（≤${maxProcessingSeconds}）`}
+                value={processing.maxSourceSeconds || maxProcessingSeconds}
                 min={1}
-                max={DEFAULT_VIDEO_PROCESSING_MAX_SOURCE_SECONDS}
+                max={maxProcessingSeconds}
                 disabled={disabled}
-                onChange={(value) => update({ processing: { ...processing, maxSourceSeconds: value || DEFAULT_VIDEO_PROCESSING_MAX_SOURCE_SECONDS } })}
+                onChange={(value) => update({ processing: { ...processing, maxSourceSeconds: value || maxProcessingSeconds } })}
             />
         </div>
     ) : null;
@@ -536,16 +545,27 @@ function TextCapabilityEditor({ value, onChange, protocol, disabled, section }: 
     );
 }
 
-function ImageCapabilityEditor({ value, onChange, protocol, model, imageParameters, disabled, section }: Required<Pick<Props, "model" | "disabled">> & Pick<Props, "value" | "onChange" | "protocol" | "section" | "imageParameters">) {
+function ImageCapabilityEditor({
+    value,
+    onChange,
+    protocol,
+    model,
+    imageParameters,
+    disabled,
+    templateEditing,
+    section,
+}: Required<Pick<Props, "model" | "disabled">> & Pick<Props, "value" | "onChange" | "protocol" | "section" | "imageParameters" | "templateEditing">) {
     const stored = normalizeModelCapabilityConfig(value || { version: 1, image: defaultImageCapabilityConfig(protocol, model) }).image!;
-    const profile = imageParameters ? resolveImageParameters(stored, imageParameters, model) : stored;
+    const profile = imageParameters ? resolveImageParameters(stored, imageParameters, model, protocol) : stored;
     const update = (patch: Partial<ImageCapabilityConfig>) => onChange?.({ version: 1, image: { ...profile, ...patch } });
     const updateReferences = (patch: Partial<ImageCapabilityConfig["references"]>) => update({ references: { ...profile.references, ...patch } });
     const updateSize = (patch: Partial<ImageCapabilityConfig["size"]>) => update({ size: { ...profile.size, ...patch } });
     const updateQuality = (patch: Partial<ImageCapabilityConfig["quality"]>) => update({ quality: { ...profile.quality, ...patch } });
 
     if (section !== "references" && profile.parameters) {
-        const definitions = imageParameters || profile.parameters;
+        // 模板声明的是可编辑范围，不能反过来成为编辑器的固定上限。
+        // 只使用参数身份和类型；实际协议的约束留到目标模型应用/保存时检查。
+        const definitions = templateEditing ? profile.parameters.map(({ name, label, type, binding, encoding, pricing, description }) => ({ name, label, type, binding, encoding, pricing, description })) : imageParameters || profile.parameters;
         const size = profile.parameters.find((p) => p.name === "size");
         return (
             <div className="space-y-4">
@@ -560,11 +580,12 @@ function ImageCapabilityEditor({ value, onChange, protocol, model, imageParamete
                                 profile,
                                 profile.parameters!.map((p) => parameters.find((next) => next.name === p.name) || p),
                                 definitions,
+                                protocol,
                             ),
                         })
                     }
                 />
-                {size ? <ImageParameterSizeEditor profile={profile} definition={definitions.find((p) => p.name === "size") || size} disabled={disabled} onChange={(image) => onChange?.({ version: 1, image })} /> : null}
+                {size ? <ImageParameterSizeEditor profile={profile} protocol={protocol} definition={definitions.find((p) => p.name === "size") || size} disabled={disabled} onChange={(image) => onChange?.({ version: 1, image })} /> : null}
                 <ImageParameterSchemaEditor
                     definitions={definitions}
                     parameters={profile.parameters.filter((p) => p.name !== "size" && p.name !== "imageResolution")}

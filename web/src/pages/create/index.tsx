@@ -1,3 +1,4 @@
+import { captureSkillLibraryAccess, hasSkillLibraryAccess, isSkillLibraryAccessCurrent, useSkillLibraryAccess } from "@/lib/skill-access";
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { App, Button, Spin } from "antd";
 import { Tooltip } from "@/components/ui/base/tooltip";
@@ -10,25 +11,32 @@ import type { AssetLibraryPickerItem } from "@/components/assets/asset-library-p
 import { generationErrorCode, generationErrorMessage } from "@/lib/generation-error";
 import { useGenerationBatchLimit } from "@/lib/generation-batch-limit";
 import { isGenerationCostUncertainError } from "@/lib/canvas/canvas-generation-batch";
-import { imageParameterRequest, normalizeImageParameters } from "@/lib/image-parameters";
+import { imageParameterRequest } from "@/lib/image-parameters";
 import { creationResultAssetIds } from "@/lib/canvas/canvas-asset-handoff";
 import { getActiveUserScope } from "@/lib/user-scope";
+import { audioUploadTitleFromFileName } from "@/lib/audio-upload-title";
 import { continueCreationConversationOnCanvas } from "@/services/creation-canvas-conversation";
 import { useAuthEntry } from "@/hooks/use-auth-entry";
 import { useExternalAssetSources } from "@/hooks/use-external-asset-sources";
 import { LEGACY_TEXT_THINKING_CONFIG, isThinkingLevel, resolveThinkingLevel, thinkingLevelsFor, type ThinkingLevel, type ThinkingRequest } from "@/lib/text-thinking";
-import { modelCapabilityConfigFor, normalizeImageValue, normalizeVideoValue, videoDurationAllowed, videoDurationOptions } from "@/lib/model-capabilities";
+import { modelCapabilityConfigFor, videoDurationAllowed, videoDurationOptions } from "@/lib/model-capabilities";
+import { preserveImageSettings as normalizeImageValue, mediaSettingIssues } from "@/lib/media-settings";
 import { inferVideoOperation, modelGroupReferenceLimits, resolveCompatibleModel, mergedImageCapabilityConfig, type ModelRequirements } from "@/lib/model-selection";
 import type { BackendGenerationResult } from "@/services/api/generation-task";
 import type { Skill } from "@/services/api/skills";
 import type { GenerationTask } from "@/services/api/task-center";
-import { loadCreationConversations, pendingCreationTaskIds, removeCreationConversationSnapshot, saveCreationConversations, updateCreationConversationSnapshot } from "@/services/creation-conversation-store";
-import { clearCreationConversationSnapshot, mergeCreationConversationSnapshot, readCreationConversationSnapshot, writeCreationConversationSnapshot } from "@/services/creation-conversation-snapshot";
+import { loadCreationConversations, pendingCreationTaskIds, removeCreationConversationSnapshot, updateCreationConversationSnapshot } from "@/services/creation-conversation-store";
+import { readCreationConversationSnapshot, writeCreationConversationSnapshot } from "@/services/creation-conversation-snapshot";
+import { localForageStorageForScope } from "@/lib/localforage-storage";
+import { creationHistoryAPI } from "@/services/api/creation-history";
+import { CreationHistorySync, CREATION_HISTORY_SYNC_KEY, type HistorySyncStatus } from "@/services/creation-history-sync";
+import { creationHistoryMedia, restoreHistoryMedia } from "@/services/creation-history-media";
 import { resolveModelChannel, resolveModelRequestConfig, selectableModelsByCapability, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
 import { useCreationPreferencesStore } from "@/stores/use-creation-preferences-store";
 import { useAssetStore, type Asset } from "@/stores/use-asset-store";
 import { loadAssetsForUse, saveRemoteUserDataNow } from "@/services/user-data-sync";
 import { useAppearanceStore } from "@/stores/use-appearance-store";
+import { useThemePack } from "@/themes/use-theme-pack";
 import { cn } from "@/lib/utils";
 import { useUserStore } from "@/stores/use-user-store";
 import type { PromptOptimizerProvider } from "@/lib/plugins/plugin-types";
@@ -83,8 +91,11 @@ import { declaredInspirationSources } from "@/lib/inspirations/catalog";
 import { fillablePrompt } from "@/lib/inspirations/resolve";
 import { CreationRecentCanvases } from "./creation-recent-canvases";
 import { CreationAgentEntry } from "./creation-agent-entry";
+import { CreationHistoryConflicts } from "./creation-history-conflicts";
 import { createCreationSubmitGate } from "./creation-submit-gate";
-import { creationVideoConfig } from "./creation-generation-config";
+import { useCreationConversationRoute } from "./use-creation-conversation-route";
+import { creationVideoConfig, creationVideoSettings } from "./creation-generation-config";
+import { trackSiteTrafficAction } from "@/services/site-traffic";
 
 const AssetLibraryPickerModal = lazy(() => import("@/components/assets/asset-library-picker-modal").then((module) => ({ default: module.AssetLibraryPickerModal })));
 const InspirationHall = lazy(() => import("@/pages/inspirations"));
@@ -136,6 +147,7 @@ export default function CreatePage() {
     const [openingCanvas, setOpeningCanvas] = useState(false);
     const openingCanvasRef = useRef(false);
     const brandName = useAppearanceStore((state) => state.appearance.brandName);
+    const themeHomeHeading = useThemePack()?.copy?.homeHeading;
     const config = useEffectiveConfig();
     const composerPreferencesHydrated = useCreationPreferencesStore((state) => state.hydrated);
     const rememberMode = useCreationPreferencesStore((state) => state.rememberMode);
@@ -165,6 +177,10 @@ export default function CreatePage() {
     const [conversationStorageReady, setConversationStorageReady] = useState(false);
     const [conversationStorageError, setConversationStorageError] = useState("");
     const [conversationLoadAttempt, setConversationLoadAttempt] = useState(0);
+    const historySessionRef = useRef<CreationHistorySync | null>(null);
+    const historyTimerRef = useRef<number | null>(null);
+    const remoteHistorySnapshots = useRef(new WeakSet<CreationConversation[]>());
+    const [historySync, setHistorySync] = useState<HistorySyncStatus>({ phase: "local" });
     const inspirationSourcesVisible = useUserStore((state) => state.features.inspirationSourcesVisible);
     const [conversationScope, setConversationScope] = useState<string | null>(() => (initialConversationSnapshot ? activeConversationScope : null));
     const [mode, setMode] = useState<CreationMode>(() => initialComposerPreferences.mode || defaultCreationMode);
@@ -173,6 +189,7 @@ export default function CreatePage() {
     const promptRef = useRef(prompt);
     const attachmentsRef = useRef(attachments);
     const [draftReferences, setDraftReferences] = useState<CreationReference[]>([]);
+    const canUseSkills = useSkillLibraryAccess();
     const [addedSkills, setAddedSkills] = useState<Skill[]>([]);
     const addedSkillsRequestedRef = useRef(false);
     const [ratio, setRatio] = useState("16:9");
@@ -189,6 +206,16 @@ export default function CreatePage() {
     const [historyOpen, setHistoryOpen] = useState(false);
     const { openAuth } = useAuthEntry();
     const [libraryOpen, setLibraryOpen] = useState(false);
+    const requireCreationLogin = useCallback(() => {
+        if (useUserStore.getState().user) return true;
+        setLibraryOpen(false);
+        openAuth({ preferDialog: true });
+        return false;
+    }, [openAuth]);
+    const openReferenceLibrary = () => {
+        if (!requireCreationLogin()) return;
+        setLibraryOpen(true);
+    };
     const externalAssetSources = useExternalAssetSources(libraryOpen);
     const abortRef = useRef<AbortController | null>(null);
     const composerFocusRef = useRef<HTMLTextAreaElement>(null);
@@ -247,7 +274,15 @@ export default function CreatePage() {
         [attachments, config, preferredModel, count, hasPrompt, imageResolution, imageParameters, mode, quality, ratio, seconds, videoQuality],
     );
     const selectedModel = resolveCompatibleModel(config, preferredModel, modelRequirements) || preferredModel;
-    const generationConfig = useMemo(() => (mode === "video" ? creationVideoConfig(config, selectedModel, { ratio, seconds, videoQuality }) : config), [config, mode, ratio, seconds, selectedModel, videoQuality]);
+    const generationConfig = useMemo(
+        () =>
+            mode === "video"
+                ? creationVideoConfig(config, selectedModel, { ratio, seconds, videoQuality })
+                : mode === "image"
+                  ? { ...config, model: selectedModel, imageModel: selectedModel, size: ratio, quality, imageResolution, imageParameters, count }
+                  : config,
+        [config, mode, ratio, seconds, selectedModel, videoQuality, quality, imageResolution, imageParameters, count],
+    );
     const imageProfile = useMemo(() => modelCapabilityConfigFor(config, selectedModel).image!, [config, selectedModel]);
     const videoProfile = useMemo(() => modelCapabilityConfigFor(config, selectedModel).video!, [config, selectedModel]);
     const textThinkingConfig = useMemo(() => (mode === "text" ? modelCapabilityConfigFor(config, selectedModel).text?.thinking || LEGACY_TEXT_THINKING_CONFIG : undefined), [config, mode, selectedModel]);
@@ -275,7 +310,15 @@ export default function CreatePage() {
         if (typeof width !== "number" || typeof height !== "number" || width <= 0 || height <= 0) return undefined;
         return { width, height };
     }, [attachments]);
-    const mentionReferences = useMemo(() => buildCreationMentionReferences(addedSkills, attachments, draftReferences), [addedSkills, attachments, draftReferences]);
+    const mentionReferences = useMemo(
+        () =>
+            buildCreationMentionReferences(
+                canUseSkills ? addedSkills : [],
+                attachments,
+                draftReferences.filter((reference) => canUseSkills || (reference.kind !== "skill" && !reference.skill)),
+            ),
+        [addedSkills, attachments, draftReferences, canUseSkills],
+    );
     const isEmpty = !activeConversation?.messages.length;
 
     // 空首页从顶部开始；有消息的对话由跟随消息逻辑管理滚动。
@@ -322,17 +365,21 @@ export default function CreatePage() {
         if (!composerPreferencesHydrated || !composerPreferencesInitialized || mode !== "image") return;
         const saved = useCreationPreferencesStore.getState().preferences.image;
         // 优先恢复用户上次选择；只有当前模型不支持该值时，normalizeImageValue 才回退到模型默认值。
-        const normalized = normalizeImageValue(imageProfile, {
-            size: saved?.ratio || imageProfile.size.default,
-            quality: saved?.quality || imageProfile.quality.default,
-            imageResolution: saved?.imageResolution || imageProfile.resolution.default,
-            imageParameters: saved?.model === selectedModel ? saved.imageParameters : undefined,
-            count: saved?.count || count,
-        });
+        const normalized = normalizeImageValue(
+            imageProfile,
+            {
+                size: saved?.ratio || imageProfile.size.default,
+                quality: saved?.quality || imageProfile.quality.default,
+                imageResolution: saved?.imageResolution,
+                imageParameters: saved?.imageParameters,
+                count: saved?.count || count,
+            },
+            resolveModelRequestConfig(config, selectedModel).interfaceType,
+        );
         setRatio(normalized.size);
         setQuality(normalized.quality);
         setImageResolution(normalized.imageResolution || imageProfile.resolution.default);
-        setImageParameters(JSON.stringify(normalizeImageParameters(imageProfile.parameters, saved?.model === selectedModel ? saved.imageParameters : undefined)));
+        setImageParameters(normalized.imageParameters || "{}");
         // 恢复上次张数时按账号同时任务数 clamp，不再被单模型 maxOutputs(=1) 压回 1。
         setCount(String(Math.max(1, Math.min(imageBatchLimit, Math.floor(Number(saved?.count || count)) || 1))));
     }, [composerPreferencesHydrated, composerPreferencesInitialized, mode, selectedModel, imageProfile]);
@@ -340,15 +387,11 @@ export default function CreatePage() {
     useEffect(() => {
         if (!composerPreferencesHydrated || !composerPreferencesInitialized || mode !== "video") return;
         const saved = useCreationPreferencesStore.getState().preferences.video;
-        // 优先恢复用户上次选择；只有当前模型不支持该值时，normalizeVideoValue 才回退到模型默认值。
-        const normalized = normalizeVideoValue(videoProfile, {
-            seconds: saved?.seconds || String(videoProfile.duration.default),
-            ratio: saved?.ratio || videoProfile.defaultRatio,
-            resolution: saved?.videoQuality || videoProfile.defaultResolution,
-        });
+        // 恢复旧消息或偏好时使用与最终提交相同的目标协议适配。
+        const normalized = creationVideoSettings(config, selectedModel, saved);
         setSeconds(normalized.seconds);
         setRatio(normalized.ratio);
-        setVideoQuality(normalized.resolution.replace(/p$/i, ""));
+        setVideoQuality(normalized.videoQuality);
     }, [composerPreferencesHydrated, composerPreferencesInitialized, mode, selectedModel, videoProfile]);
 
     useEffect(() => {
@@ -360,46 +403,82 @@ export default function CreatePage() {
 
     useEffect(() => {
         if (!userSessionHydrated) return;
-        let cancelled = false;
         const scope = getActiveUserScope();
-        const cached = readCreationConversationSnapshot<CreationConversation>(scope);
+        const controller = new AbortController();
+        const active = () => !controller.signal.aborted && getActiveUserScope() === scope && (useUserStore.getState().user?.id || null) === userId;
+        const storage = localForageStorageForScope(scope);
         setConversationStorageReady(false);
         setConversationStorageError("");
-        if (cached?.length) {
-            conversationsRef.current = cached;
-            setConversations(cached);
-            setActiveId((current) => (cached.some((item) => item.id === current) ? current : cached[0].id));
+        setHydrated(false);
+        const display = (items: CreationConversation[]) => {
+            if (!active()) return;
+            const next = items.length ? items.map((item) => ({ ...item, messages: item.messages.map(restoreHistoryMedia) })) : [newConversation()];
+            remoteHistorySnapshots.current.add(next);
+            conversationsRef.current = next;
+            writeCreationConversationSnapshot(scope, next);
+            setConversations(next);
+            setActiveId((current) => (next.some((item) => item.id === current) ? current : next[0].id));
             setConversationScope(scope);
-            setConversationStorageError("");
-            setHydrated(true);
-        } else {
-            setHydrated(false);
-            setConversationScope(null);
-            setConversations([]);
-            setActiveId("");
-        }
-        void loadCreationConversations<CreationConversation>()
-            .then((stored) => {
-                if (cancelled || getActiveUserScope() !== scope || (useUserStore.getState().user?.id || null) !== userId) return;
-                const next = cached?.length ? mergeCreationConversationSnapshot(cached, stored || []) : stored?.length ? stored : [newConversation()];
-                conversationsRef.current = next;
-                writeCreationConversationSnapshot(scope, next);
-                setConversations(next);
-                setActiveId((current) => (next.some((item) => item.id === current) ? current : next[0].id));
-                setConversationScope(scope);
-                setConversationStorageError("");
+        };
+        const session = new CreationHistorySync({
+            read: async () => await storage.getItem(CREATION_HISTORY_SYNC_KEY),
+            readLegacy: () => loadCreationConversations<CreationConversation>(scope),
+            write: async (value) => {
+                await storage.setItem(CREATION_HISTORY_SYNC_KEY, value);
+            },
+            api: creationHistoryAPI(scope, controller.signal),
+            prepare: creationHistoryMedia(scope, controller.signal, active),
+            cloud: Boolean(userId),
+            active,
+            onChange: display,
+            onStatus: (status) => {
+                if (active()) setHistorySync(status);
+            },
+        });
+        historySessionRef.current = session;
+        void session
+            .load()
+            .then((items) => {
+                if (!active()) return;
+                display(items);
                 setConversationStorageReady(true);
                 setHydrated(true);
+                void session.sync();
             })
             .catch((error: unknown) => {
-                if (cancelled || getActiveUserScope() !== scope || (useUserStore.getState().user?.id || null) !== userId) return;
-                setConversationStorageError(error instanceof Error ? error.message : "读取本地创作记录失败");
-                if (!cached?.length) setHydrated(true);
+                if (active()) setConversationStorageError(error instanceof Error ? error.message : "读取本地创作记录失败");
             });
+        const refresh = () => {
+            if (active() && document.visibilityState !== "hidden") void session.sync();
+        };
+        window.addEventListener("online", refresh);
+        window.addEventListener("focus", refresh);
+        document.addEventListener("visibilitychange", refresh);
+        const poll = window.setInterval(refresh, 15000);
         return () => {
-            cancelled = true;
+            controller.abort();
+            session.dispose();
+            if (historySessionRef.current === session) historySessionRef.current = null;
+            if (historyTimerRef.current) window.clearTimeout(historyTimerRef.current);
+            historyTimerRef.current = null;
+            window.clearInterval(poll);
+            window.removeEventListener("online", refresh);
+            window.removeEventListener("focus", refresh);
+            document.removeEventListener("visibilitychange", refresh);
         };
     }, [userId, userSessionHydrated, conversationLoadAttempt]);
+
+    const saveConversationHistory = useCallback(async (items: CreationConversation[]) => {
+        const session = historySessionRef.current;
+        if (!session) throw new Error("创作历史尚未就绪");
+        await session.save(items);
+        if (session !== historySessionRef.current) return;
+        if (!historyTimerRef.current)
+            historyTimerRef.current = window.setTimeout(() => {
+                historyTimerRef.current = null;
+                if (session === historySessionRef.current) void session.sync();
+            }, 700);
+    }, []);
 
     useEffect(() => () => abortRef.current?.abort(), []);
 
@@ -411,8 +490,9 @@ export default function CreatePage() {
         conversationsRef.current = conversations;
         if (!userSessionHydrated || !hydrated || !conversationStorageReady || conversationScope !== getActiveUserScope()) return;
         writeCreationConversationSnapshot(conversationScope, conversations);
-        void saveCreationConversations(conversations).catch((error) => {
-            console.warn("创作会话持久化失败；当前会话仍保留在内存快照", error);
+        if (remoteHistorySnapshots.current.has(conversations)) return;
+        void saveConversationHistory(conversations).catch((error) => {
+            setHistorySync({ phase: "error", message: error instanceof Error ? error.message : "本地缓存写入失败" });
         });
     }, [conversations, conversationScope, hydrated, userSessionHydrated]);
 
@@ -424,12 +504,19 @@ export default function CreatePage() {
         [],
     );
 
+    useEffect(() => {
+        setAddedSkills([]);
+        addedSkillsRequestedRef.current = false;
+    }, [canUseSkills, userId]);
     const loadAddedSkills = useCallback(() => {
-        if (addedSkillsRequestedRef.current) return;
+        const access = captureSkillLibraryAccess();
+        if (!access || addedSkillsRequestedRef.current) return;
         addedSkillsRequestedRef.current = true;
         void import("@/services/api/skills")
             .then(({ listAddedSkills }) => listAddedSkills())
-            .then(({ skills }) => setAddedSkills(skills))
+            .then(({ skills }) => {
+                if (isSkillLibraryAccessCurrent(access)) setAddedSkills(skills);
+            })
             .catch(() => setAddedSkills([]));
     }, []);
 
@@ -459,7 +546,7 @@ export default function CreatePage() {
         }));
         conversationsRef.current = next;
         setConversations(next);
-        await saveCreationConversations(next);
+        await saveConversationHistory(next);
     }, []);
 
     /**
@@ -468,9 +555,12 @@ export default function CreatePage() {
      */
     const applyCreationTaskSnapshots = useCallback(
         async (runtime: CreationRuntime, tasks: GenerationTask[], signal: AbortSignal): Promise<PersistedCreationTask[]> => {
+            const session = historySessionRef.current;
+            const scope = getActiveUserScope();
+            const active = () => !signal.aborted && session === historySessionRef.current && scope === getActiveUserScope();
             const contextual = attachCreationTaskContexts(tasks, conversationsRef.current);
             const persistedTasks = await materializeCreationTaskResults(runtime, contextual, signal);
-            if (signal.aborted) return persistedTasks;
+            if (!active()) return persistedTasks;
             const attachable = persistedTasks.filter(
                 (task) => task.status === "succeeded" && Boolean(task.clientContext?.conversationId && task.clientContext.messageId) && Boolean(task.creationResultUrls?.length || task.creationResultStorageKeys?.length),
             );
@@ -482,7 +572,7 @@ export default function CreatePage() {
                         task,
                         messageId,
                         async ({ effectKey, resultUrls, resultStorageKeys }) => {
-                            if (signal.aborted) return;
+                            if (!active()) return;
                             await updateConversationMessage(
                                 conversationId,
                                 messageId,
@@ -700,7 +790,7 @@ export default function CreatePage() {
         if (file.type.startsWith("audio/")) {
             const uploaded = await uploadMediaFile(file, "create-upload");
             return {
-                asset: creationAudioAsset({ title: file.name, uploaded, metadata: { source: "create-upload", fileName: file.name } }),
+                asset: creationAudioAsset({ title: audioUploadTitleFromFileName(file.name), uploaded, metadata: { source: "create-upload", fileName: file.name } }),
                 attachment: creationAttachmentFromAudio(file, uploaded),
             };
         }
@@ -715,6 +805,7 @@ export default function CreatePage() {
         };
     };
     const uploadLibraryAssets = async (files: FileList | File[]) => {
+        if (!requireCreationLogin()) return [];
         const next = Array.from(files).filter((file) => creationFileAccepted(mode, file));
         if (!next.length) return [];
         const settled = await Promise.allSettled(
@@ -731,6 +822,7 @@ export default function CreatePage() {
     };
 
     const handleLibrarySelect = async (selectedIds: string[], pickedItems = libraryItems) => {
+        if (!requireCreationLogin()) return;
         const next = creationLibrarySelectionToAttachments(selectedIds, pickedItems, mode, videoReferenceLimits);
         if (!next.length) return;
         const selected = new Set(selectedIds);
@@ -801,6 +893,7 @@ export default function CreatePage() {
 
     const replaceReferenceFromFiles = useCallback(
         async (targetAttachmentId: string, files: File[]) => {
+            if (!requireCreationLogin()) return;
             if (busy || referenceReplacementBusy) return;
             const file = files.find((item) => item.type.startsWith("image/"));
             if (!file) {
@@ -819,7 +912,7 @@ export default function CreatePage() {
                 setReferenceReplacementBusy(false);
             }
         },
-        [addAsset, busy, referenceReplacementBusy, replaceAttachmentReference, toast],
+        [addAsset, busy, referenceReplacementBusy, replaceAttachmentReference, requireCreationLogin, toast],
     );
 
     const submit = async (retryContext?: CreationRetryContext, retryLockKey?: string) => {
@@ -853,7 +946,16 @@ export default function CreatePage() {
             releaseSubmitGate();
             return;
         }
-        if (mode === "video" && !videoDurationAllowed(videoProfile, Number(seconds))) {
+        const settingsError = mediaSettingIssues(generationConfig, mode, selectedModel)
+            .map((item) => item.message)
+            .join("；");
+        if (settingsError) {
+            toast.error(settingsError);
+            releaseRetryLock();
+            releaseSubmitGate();
+            return;
+        }
+        if (mode === "video" && videoProfile.durationSupported !== false && !videoDurationAllowed(videoProfile, Number(generationConfig.videoSeconds))) {
             toast.error(t("create.page.durationUnsupported"));
             releaseRetryLock();
             releaseSubmitGate();
@@ -877,7 +979,7 @@ export default function CreatePage() {
             audioCount: referenceAudios.length,
             characterCount: 0,
         });
-        const skillReferences = references.flatMap((reference) => (reference.skill ? [reference.skill] : []));
+        const skillReferences = hasSkillLibraryAccess() ? references.flatMap((reference) => (reference.skill ? [reference.skill] : [])) : [];
         let runtime: CreationRuntime;
         try {
             runtime = await loadCreationRuntime();
@@ -1153,7 +1255,9 @@ export default function CreatePage() {
     }, [retrySequence]);
 
     const startNewConversation = () => {
+        if (busy || openingCanvas || !conversationStorageReady) return activeId;
         const next = newConversation();
+        setAgentMode(false);
         followLatestMessageRef.current = true;
         setConversations((current) => [next, ...current]);
         setActiveId(next.id);
@@ -1161,6 +1265,7 @@ export default function CreatePage() {
         setAttachments([]);
         setDraftReferences([]);
         setHistoryOpen(false);
+        return next.id;
     };
 
     const continueOnCanvas = async (selectedAssetIds?: string[]) => {
@@ -1190,7 +1295,7 @@ export default function CreatePage() {
             const next = updateCreationConversationSnapshot(conversationsRef.current, source.id, (item) => ({ ...item, canvasId: result.id }));
             conversationsRef.current = next;
             setConversations(next);
-            await saveCreationConversations(next);
+            await saveConversationHistory(next);
             if (scope !== getActiveUserScope()) return;
             if (result.syncError) toast.warning(t("create.page.handoffSyncPending"));
             const params = new URLSearchParams({ conversation: result.sessionId });
@@ -1208,6 +1313,8 @@ export default function CreatePage() {
     };
 
     const selectConversation = (conversation: CreationConversation) => {
+        if (busy || openingCanvas || !conversationStorageReady) return;
+        setAgentMode(false);
         followLatestMessageRef.current = true;
         setActiveId(conversation.id);
         setPrompt("");
@@ -1216,7 +1323,28 @@ export default function CreatePage() {
         setHistoryOpen(false);
     };
 
+    const selectConversationRoute = useCreationConversationRoute({
+        scope: activeConversationScope,
+        ready: userSessionHydrated && hydrated && conversationStorageReady && conversationScope === activeConversationScope,
+        activeId,
+        canSelect: !busy && !openingCanvas,
+        ids: conversations.map((conversation) => conversation.id),
+        onSelect: (id) => {
+            const conversation = conversationsRef.current.find((item) => item.id === id);
+            if (conversation) selectConversation(conversation);
+        },
+        onNew: startNewConversation,
+    });
+    const startNewConversationFromHistory = () => selectConversationRoute(startNewConversation());
+    const selectConversationFromHistory = (conversation: CreationConversation) => {
+        if (busy || openingCanvas || !conversationStorageReady) return;
+        selectConversation(conversation);
+        selectConversationRoute(conversation.id);
+    };
+
     const confirmDeleteConversation = (conversation: CreationConversation) => {
+        const session = historySessionRef.current;
+        const scope = getActiveUserScope();
         const title = conversation.title.trim() || t("create.conversation.untitled");
         const label = title.length > 32 ? `${title.slice(0, 32)}...` : title;
         modal.confirm({
@@ -1228,17 +1356,21 @@ export default function CreatePage() {
             cancelText: t("create.page.deleteKeep"),
             onOk: async () => {
                 try {
+                    if (!session || session !== historySessionRef.current || scope !== getActiveUserScope()) throw new Error("账号已切换");
                     const remaining = removeCreationConversationSnapshot(conversationsRef.current, conversation.id);
                     const sortedRemaining = [...remaining].sort((left, right) => conversationTimestamp(right.updatedAt) - conversationTimestamp(left.updatedAt));
                     const fallback = sortedRemaining.find((item) => item.messages.length > 0) || sortedRemaining[0] || newConversation();
                     const next = remaining.length ? remaining : [fallback];
-                    await saveCreationConversations(next);
+                    await session.remove(conversation.id, next);
+                    if (session !== historySessionRef.current || scope !== getActiveUserScope()) return;
+                    void session.sync();
                     conversationsRef.current = next;
                     setConversations(next);
                     if (activeIdRef.current === conversation.id) {
                         followLatestMessageRef.current = true;
                         activeIdRef.current = fallback.id;
                         setActiveId(fallback.id);
+                        selectConversationRoute(fallback.id);
                         setPrompt("");
                         setAttachments([]);
                         setDraftReferences([]);
@@ -1258,7 +1390,7 @@ export default function CreatePage() {
         const next = updateCreationConversationSnapshot(conversationsRef.current, conversation.id, (item) => ({ ...item, title: nextTitle }));
         conversationsRef.current = next;
         setConversations(next);
-        void saveCreationConversations(next).catch((error) => toast.error(error instanceof Error ? error.message : t("create.page.renameFailed")));
+        void saveConversationHistory(next).catch((error) => toast.error(error instanceof Error ? error.message : t("create.page.renameFailed")));
     };
 
     const restoreMessageDraft = (item: CreationMessage) => {
@@ -1287,6 +1419,8 @@ export default function CreatePage() {
             followLatestMessageRef.current = true;
             restoreMessageDraft(previous);
             const removedIds = new Set([item.id, previous.id]);
+            if (activeConversation)
+                void historySessionRef.current?.removeMessages(activeConversation.id, [...removedIds]).catch((error: unknown) => setHistorySync({ phase: "error", message: error instanceof Error ? error.message : "本地删除记录保存失败" }));
             updateActive((conversation) => {
                 const messages = conversation.messages.filter((message) => !removedIds.has(message.id));
                 const firstPrompt = messages.find((message) => message.role === "user")?.content.trim();
@@ -1406,7 +1540,7 @@ export default function CreatePage() {
         onReorderAttachments: reorderAttachments,
         onReplaceAttachment: replaceReferenceFromTrack,
         onReplaceReferenceFiles: replaceReferenceFromFiles,
-        onOpenLibrary: () => setLibraryOpen(true),
+        onOpenLibrary: openReferenceLibrary,
         onModeChange: selectMode,
         model: selectedModel,
         modelRequirements,
@@ -1441,12 +1575,25 @@ export default function CreatePage() {
         promptOptimizerProvider,
         composerFocusRef,
         onPromptFocus: loadAddedSkills,
-        onSubmit: () => void submit(),
+        onSubmit: () => {
+            if (prompt.trim() && !busy && !referenceReplacementBusy) trackSiteTrafficAction(mode === "text" ? "creation_submit_text" : mode === "image" ? "creation_submit_image" : "creation_submit_video");
+            void submit();
+        },
     };
 
     return (
         <>
             <div className="creation-home relative flex h-full min-h-0 flex-col overflow-hidden">
+                <p role="status" aria-live="polite" className="mx-auto px-4 py-1 text-xs text-foreground/55">
+                    <span title={historySync.message}>{t(`create.historySync.${historySync.phase}`)}</span>
+                    {historySync.message ? <span> · {historySync.message}</span> : null}
+                    {historySync.phase === "error" ? (
+                        <button type="button" className="ml-2 underline" onClick={() => void historySessionRef.current?.sync()}>
+                            {t("create.historySync.retry")}
+                        </button>
+                    ) : null}
+                    <CreationHistoryConflicts key={activeConversationScope} session={historySessionRef.current} status={historySync} busy={busy} />
+                </p>
                 {conversationStorageError ? (
                     <p role="status" className="mx-auto mb-3 max-w-3xl px-4 text-xs text-foreground/55">
                         本地历史读取失败，当前会话仍保留。 {conversationStorageError}{" "}
@@ -1496,7 +1643,7 @@ export default function CreatePage() {
                             <section ref={launchpadRef} className="creation-launchpad" aria-label={t("create.page.launchpadLabel")}>
                                 <header className="creation-start-heading">
                                     <div>
-                                        <h1>{t("create.page.heading", { brand: brandName })}</h1>
+                                        <h1>{themeHomeHeading || t("create.page.heading", { brand: brandName })}</h1>
                                         <p>{t("create.page.subheading")}</p>
                                     </div>
                                     <button type="button" className="creation-history-entry" aria-label={t("create.page.viewHistory")} aria-expanded={historyOpen} onClick={() => setHistoryOpen(true)}>
@@ -1526,6 +1673,7 @@ export default function CreatePage() {
                                 <CreationEmptySuggest
                                     onStartPrompt={startPrompt}
                                     onOpenLibrary={() => {
+                                        if (!requireCreationLogin()) return;
                                         setAgentMode(false);
                                         selectMode("image");
                                         setLibraryOpen(true);
@@ -1567,7 +1715,7 @@ export default function CreatePage() {
                 ) : (
                     <div className="creation-thread-workbench">
                         <CreationWorkspaceToolbar
-                            onNewConversation={startNewConversation}
+                            onNewConversation={startNewConversationFromHistory}
                             onOpenHistory={() => setHistoryOpen(true)}
                             shots={videoShots}
                             onJumpToShot={jumpToShot}
@@ -1609,9 +1757,9 @@ export default function CreatePage() {
                 open={historyOpen}
                 conversations={historyConversations}
                 activeId={activeConversation.id}
-                onNew={startNewConversation}
+                onNew={startNewConversationFromHistory}
                 onClose={() => setHistoryOpen(false)}
-                onSelect={selectConversation}
+                onSelect={selectConversationFromHistory}
                 onDelete={confirmDeleteConversation}
                 onRename={renameConversationTitle}
             />
@@ -1630,7 +1778,14 @@ export default function CreatePage() {
                             accept: creationUploadAccept(mode),
                             description: mode === "text" ? t("create.page.uploadHintText") : mode === "video" ? t("create.page.uploadHintVideo") : t("create.page.uploadHintImage"),
                             onUpload: uploadLibraryAssets,
-                            external: { accept: "image/*", description: t("create.page.uploadHintEagle"), onUpload: (files, folderId) => externalAssetSources.uploadExternalFiles(files, folderId) },
+                            external: {
+                                accept: "image/*",
+                                description: t("create.page.uploadHintEagle"),
+                                onUpload: (files, folderId) => {
+                                    if (!requireCreationLogin()) return Promise.resolve([]);
+                                    return externalAssetSources.uploadExternalFiles(files, folderId);
+                                },
+                            },
                         }}
                         onClose={() => setLibraryOpen(false)}
                         onConfirm={handleLibrarySelect}

@@ -122,8 +122,11 @@ const (
 	DefaultVideoProcessingMaxSourceSeconds = 180
 	// VideoProcessingOperationEnhance 是画质增强任务的 operation，前后端与价格档共用。
 	VideoProcessingOperationEnhance = "enhance"
+	VideoProcessingOperationDepth   = "depth"
+	MediaKitDepthMaxSourceSeconds   = 600
 	// VolcengineMediaKitEnhanceVideoProtocol 是官方插件 volcengine-mediakit 的画质增强 provider。
 	VolcengineMediaKitEnhanceVideoProtocol = "volcengine-mediakit-enhance-video"
+	VolcengineMediaKitVideoDepthProtocol   = "volcengine-mediakit-video-depth"
 )
 
 // VideoProcessingConfig 是视频处理工具的后台配置：帧率策略决定用户是否选择帧率，
@@ -258,13 +261,15 @@ func NormalizeModelCapabilityConfigForModel(capability string, protocol string, 
 		if input == nil || input.Image == nil {
 			return nil, BadAuthRequest("请配置图片模型能力参数")
 		}
+		if input.Image.Parameters == nil {
+			normalizeLegacyImageResolutionConfig(protocol, input.Image)
+		}
 		if len(registries) > 0 && registries[0] != nil {
-			if adapter, ok := registries[0].Resolve(protocol); ok && adapter.Metadata().ImageParameters != nil {
-				if err := resolveImageCapabilityParameters(input.Image, adapter.Metadata().ImageParameters, modelName); err != nil {
+			if adapter, ok := registries[0].Resolve(protocol); ok {
+				metadata := adapter.Metadata()
+				if err := resolveImageCapabilityParameters(input.Image, metadata.ImageParameters, modelName, metadata.Create); err != nil {
 					return nil, err
 				}
-			} else if input.Image.Parameters != nil {
-				return nil, BadAuthRequest("当前插件未声明图片参数合同，请先更新插件")
 			}
 		}
 		if input.Image.Parameters != nil {
@@ -288,7 +293,8 @@ func NormalizeModelCapabilityConfigForModel(capability string, protocol string, 
 	if input == nil || input.Video == nil {
 		return nil, BadAuthRequest("请配置视频模型能力参数")
 	}
-	video := applyModelSpecificVideoCapability(input.Video, protocol, modelName)
+	// 已保存和提交的能力由管理员决定；型号建议只用于构造默认配置。
+	video := input.Video
 	if strings.TrimSpace(protocol) == "autodl-comfyui" {
 		var err error
 		video, err = normalizeAutoDLVideoScreenSpec(video, modelName)
@@ -496,8 +502,10 @@ func CapabilitySpecFromModelCapabilityConfig(config *ModelCapabilityConfig, capa
 		}
 		if video.Processing != nil {
 			// 处理类模型的 videoSeconds 是服务端测得的源时长，fpsBand 只用于价格档选择。
-			spec.Options["videoSeconds"] = numericRange(1, float64(videoProcessingMaxSourceSeconds(video.Processing)), 1)
-			spec.Options["fpsBand"] = anyValues(videoProcessingFPSBands)
+			spec.Options["videoSeconds"] = numericRange(1, float64(videoProcessingMaxSourceSeconds(video)), 1)
+			if video.DefaultOperation != VideoProcessingOperationDepth {
+				spec.Options["fpsBand"] = anyValues(videoProcessingFPSBands)
+			}
 		}
 		if video.GenerateAudio.Supported {
 			spec.Options["videoGenerateAudio"] = boolValues(true)

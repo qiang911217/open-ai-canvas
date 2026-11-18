@@ -188,7 +188,7 @@ func TestImageParametersPublicIntentDoesNotOverwriteEncodedPixelSize(t *testing.
 		encoded, _ := json.Marshal(spec.Body)
 		_ = json.Unmarshal(encoded, &body)
 	}
-	if body["size"] != "2496x1664" || body["quality"] != "max" || body["resolution"] != "2k" {
+	if body["size"] != "2496x1664" || body["quality"] != "max" || body["resolution"] != nil {
 		t.Fatalf("encoded request = %#v", body)
 	}
 }
@@ -347,6 +347,10 @@ func TestImageParametersPixelSelectionKeepsExactSizeWithoutResolution(t *testing
 	profile.Image.Size.Presets = []ImageSizePreset{{Tier: "1k", Ratio: "1:1", Width: 1024, Height: 1024, Size: "1024x1024"}, {Tier: "2k", Ratio: "1:1", Width: 2048, Height: 2048, Size: "2048x2048"}}
 	if err := projectImageParameters(profile.Image); err != nil {
 		t.Fatal(err)
+	}
+	spec, err := CapabilitySpecFromModelCapabilityConfig(profile, "image")
+	if err != nil || spec.ImageSize == nil || len(spec.ImageSize.Presets) != 2 {
+		t.Fatalf("pixel-only public projection lost configured groups: %#v %v", spec.ImageSize, err)
 	}
 	config := providerConfig{InterfaceType: "opaque-provider", Size: "2048x2048", ImageParameters: map[string]any{"size": "2048x2048"}}
 	if err := applyImageParameterValues(&config, profile.Image); err != nil {

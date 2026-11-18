@@ -24,7 +24,10 @@ import { CreditSymbol, requestCreditCost } from "@/constant/credits";
 import { ASSET_CATEGORY_LABELS } from "@/lib/asset-category";
 import { formatShotOrdinal } from "@/lib/shot-label";
 import { buildImageResolutionOptions, formatImageResolutionSize, supportsImageResolutionPresets } from "@/lib/image-resolution-tiers";
-import { normalizeVideoValue, videoDurationOptions, type ImageCapabilityConfig, type VideoCapabilityConfig } from "@/lib/model-capabilities";
+import { videoDurationOptions, type ImageCapabilityConfig, type VideoCapabilityConfig } from "@/lib/model-capabilities";
+import { preserveVideoSettings as normalizeVideoValue } from "@/lib/media-settings";
+import { mediaSettingIssues } from "@/lib/media-settings";
+import { MediaSettingsNotice } from "@/components/media-settings-notice";
 import { mergedImageCapabilityConfig, type ModelRequirements } from "@/lib/model-selection";
 import { imageQualityLabel } from "@/lib/image-quality";
 import { modelQuoteDescription, modelQuoteRequest } from "@/lib/model-pricing";
@@ -219,8 +222,12 @@ export function CreationComposer(props: ComposerProps) {
     const interactionBusy = props.busy || props.referenceReplacementBusy;
     // 创作页张数等于拆单数，上限按账号同时任务数，硬上限仍为 15。
     const imageBatchLimit = Math.min(15, useGenerationBatchLimit());
-    const canSubmit = Boolean(props.prompt.trim()) && !interactionBusy;
+    const settingsError = mediaSettingIssues(props.config, props.mode, props.model)
+        .map((item) => item.message)
+        .join("；");
+    const canSubmit = Boolean(props.prompt.trim()) && !interactionBusy && !settingsError;
     const creditsEnabled = useUserStore((state) => state.features.creditsEnabled);
+    const userId = useUserStore((state) => state.user?.id);
     const priceChannel = resolveModelChannel(props.config, props.model);
     // 实际提交单数与 index.tsx 的 taskCount 同样 clamp。
     const imageTaskCount = Math.max(1, Math.min(imageBatchLimit, Math.floor(Number(props.count)) || 1));
@@ -241,7 +248,7 @@ export function CreationComposer(props: ComposerProps) {
         requirements: props.modelRequirements,
     });
     useEffect(() => {
-        if (!creditsEnabled || !quoteRequest) {
+        if (!userId || !creditsEnabled || !quoteRequest) {
             setRouteQuote(null);
             return;
         }
@@ -253,11 +260,11 @@ export function CreationComposer(props: ComposerProps) {
                 if (!controller.signal.aborted) setRouteQuote(null);
             });
         return () => controller.abort();
-    }, [creditsEnabled, quoteRequest]);
+    }, [creditsEnabled, quoteRequest, userId]);
     const generationCredits = routeQuote ? batchQuoteTotal(routeQuote.amountMicrocredits, props.mode === "image" ? imageTaskCount : 1) : credits;
     const showCost = creditsEnabled && generationCredits !== null && generationCredits !== undefined;
     const formattedCredits = generationCredits?.toLocaleString("zh-CN", { maximumFractionDigits: 6 });
-    const actionLabel = props.referenceReplacementBusy ? "正在替换参考图" : interactionBusy || (props.generationActive && !canSubmit) ? "生成中" : showCost ? `${routeQuote?.estimated ? "预估" : "消耗"} ${formattedCredits} 积分，发送` : "发送";
+    const actionLabel = props.referenceReplacementBusy ? "正在替换参考图" : interactionBusy || (props.generationActive && !canSubmit) ? "生成中" : showCost ? `${!userId || routeQuote?.estimated ? "预估" : "消耗"} ${formattedCredits} 积分，发送` : "发送";
     // Send-button working state must span the WHOLE generation (not just the
     // submit-lock window): spinner + glow stay while a message is pending and
     // the composer is empty; typing a next prompt returns the arrow so the
@@ -600,6 +607,21 @@ export function CreationComposer(props: ComposerProps) {
                     </span>
                 </Button>
             </footer>
+            {props.mode === "image" || props.mode === "video" ? (
+                <MediaSettingsNotice
+                    config={{ ...props.config, model: props.model }}
+                    capability={props.mode}
+                    onChange={(field, value) => {
+                        if (field === "size") props.setRatio(value);
+                        else if (field === "quality") props.setQuality(value);
+                        else if (field === "imageResolution") props.setImageResolution(value);
+                        else if (field === "imageParameters") props.setImageParameters(value);
+                        else if (field === "count") props.setCount(value);
+                        else if (field === "videoSeconds") props.setSeconds(value);
+                        else if (field === "vquality") props.setVideoQuality(value);
+                    }}
+                />
+            ) : null}
             <CreationMediaPreviewModal url={previewUrl} type={previewType} onClose={() => setPreviewUrl("")} />
         </SpotlightSurface>
     );
@@ -895,9 +917,9 @@ function ThinkingControl({ levels, value, resolvedLevel, onChange, disabled }: {
     );
 }
 
-function DurationMenu({ profile, seconds, onChange }: { profile: VideoCapabilityConfig; seconds: string; onChange: (value: string) => void }) {
+function DurationMenu({ profile, seconds, onChange, protocol }: { profile: VideoCapabilityConfig; seconds: string; onChange: (value: string) => void; protocol?: string }) {
     const [open, setOpen] = useState(false);
-    const value = Number(normalizeVideoValue(profile, { seconds }).seconds);
+    const value = Number(normalizeVideoValue(profile, { seconds }, protocol).seconds);
     const presets = profile.duration.selection === "enum" ? videoDurationOptions(profile) : [];
     const fallbackPreset = presets.length ? presets : [profile.duration.default];
     const min = profile.duration.selection === "range" ? profile.duration.min || 1 : Math.min(...fallbackPreset);
